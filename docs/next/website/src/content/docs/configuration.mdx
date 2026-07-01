@@ -385,7 +385,7 @@ Sound notifications are enabled by default and are played by the local Herdr cli
 enabled = true
 ```
 
-Herdr plays a done sound when an agent finishes and an attention sound when an agent needs input. Set `enabled = false` on shared machines or remote servers unless you explicitly want audio.
+Herdr plays a done sound when an agent finishes and an attention sound when an agent needs input. Sound notifications also emit a terminal bell so the host terminal can flash, bounce, or show its configured bell indicator. Set `enabled = false` on shared machines or remote servers unless you explicitly want audio or terminal bell alerts.
 
 On macOS, Herdr uses `afplay`. On Linux, Herdr tries mp3-capable players in order: `paplay`, `pw-play`, `ffplay`, `mpg123`, then `mpv`. If no player is available, sound playback is skipped and Herdr logs a warning.
 

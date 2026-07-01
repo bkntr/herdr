@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- Sound notifications now also emit a terminal bell so the host terminal can flash, bounce, or otherwise surface the alert even when no audio player is available. (#465)
+
 ## [0.7.3] - 2026-07-08
 
 ### Fixed
