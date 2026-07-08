@@ -43,6 +43,20 @@ install-hooks:
 build:
     cargo build --release --locked
 
+# Replace the installed herdr on PATH with the release binary from this checkout
+install: build
+    @set -eu; \
+    dest="$(command -v herdr || true)"; \
+    if [ -z "$dest" ]; then \
+        echo "error: herdr is not on PATH" >&2; \
+        exit 1; \
+    fi; \
+    tmp="$dest.tmp.$$"; \
+    cp target/release/herdr "$tmp"; \
+    chmod 755 "$tmp"; \
+    mv "$tmp" "$dest"; \
+    echo "installed target/release/herdr to $dest"
+
 # Build the website and documentation
 website-build:
     cd website && bun install --frozen-lockfile && bun run build

@@ -457,6 +457,28 @@ fn show_desktop_notification_with_command(
     body: Option<&str>,
     mut command: impl FnMut(&str) -> Command,
 ) -> std::io::Result<bool> {
+    show_desktop_notification_for_env(title, body, is_wsl(), &mut command)
+}
+
+fn show_desktop_notification_for_env(
+    title: &str,
+    body: Option<&str>,
+    wsl: bool,
+    mut command: impl FnMut(&str) -> Command,
+) -> std::io::Result<bool> {
+    if wsl && show_wsl_desktop_notification_with_command(title, body, &mut command).unwrap_or(false)
+    {
+        return Ok(true);
+    }
+
+    show_libnotify_desktop_notification_with_command(title, body, command)
+}
+
+fn show_libnotify_desktop_notification_with_command(
+    title: &str,
+    body: Option<&str>,
+    mut command: impl FnMut(&str) -> Command,
+) -> std::io::Result<bool> {
     if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return Ok(false);
     }
@@ -467,6 +489,85 @@ fn show_desktop_notification_with_command(
         cmd.arg(body);
     }
     run_notification_command(cmd)
+}
+
+fn show_wsl_desktop_notification_with_command(
+    title: &str,
+    body: Option<&str>,
+    command: &mut impl FnMut(&str) -> Command,
+) -> std::io::Result<bool> {
+    let mut cmd = command("powershell.exe");
+    build_wsl_powershell_notification_command(&mut cmd, title, body);
+    run_background_notification_command(cmd)
+}
+
+fn build_wsl_powershell_notification_command(cmd: &mut Command, title: &str, body: Option<&str>) {
+    cmd.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Sta",
+        "-Command",
+        wsl_powershell_notification_script(),
+    ])
+    .env("HERDR_NOTIFY_TITLE", title)
+    .env("HERDR_NOTIFY_BODY", body.unwrap_or_default())
+    .env(
+        "WSLENV",
+        wsl_notification_wslenv(std::env::var("WSLENV").ok().as_deref()),
+    );
+}
+
+fn wsl_powershell_notification_script() -> &'static str {
+    r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$Title = $env:HERDR_NOTIFY_TITLE
+$Body = $env:HERDR_NOTIFY_BODY
+if ([string]::IsNullOrWhiteSpace($Title)) { $Title = 'Herdr' }
+$BodyText = if ([string]::IsNullOrWhiteSpace($Body)) { $Title } else { $Body }
+$toast = [System.Windows.Forms.NotifyIcon]::new()
+try {
+    $toast.Icon = [System.Drawing.SystemIcons]::Information
+    $toast.Text = 'Herdr'
+    $toast.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+    $toast.BalloonTipTitle = $Title
+    $toast.BalloonTipText = $BodyText
+    $toast.Visible = $true
+    $toast.ShowBalloonTip(5000)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds(5500)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 100
+    }
+} finally {
+    $toast.Visible = $false
+    $toast.Dispose()
+}
+"#
+}
+
+fn wsl_notification_wslenv(existing: Option<&str>) -> String {
+    let mut value = existing.unwrap_or_default().to_string();
+    for name in ["HERDR_NOTIFY_TITLE", "HERDR_NOTIFY_BODY"] {
+        if !wslenv_contains_var(&value, name) {
+            if !value.is_empty() {
+                value.push(':');
+            }
+            value.push_str(name);
+        }
+    }
+    value
+}
+
+fn wslenv_contains_var(existing: &str, name: &str) -> bool {
+    existing
+        .split(':')
+        .filter_map(|entry| entry.split('/').next())
+        .any(|entry_name| entry_name == name)
 }
 
 fn run_notification_command(mut command: Command) -> std::io::Result<bool> {
@@ -482,6 +583,53 @@ fn run_notification_command(mut command: Command) -> std::io::Result<bool> {
     };
 
     Ok(status.success())
+}
+
+fn run_background_notification_command(mut command: Command) -> std::io::Result<bool> {
+    let child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    std::thread::spawn(move || match child.wait_with_output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            tracing::warn!(
+                status = ?output.status,
+                stderr = %stderr.trim(),
+                stdout = %stdout.trim(),
+                "background notification command failed"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(err = %err, "failed to wait for background notification command");
+        }
+    });
+    Ok(true)
+}
+
+fn contains_wsl_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("microsoft") || lower.contains("wsl2") || lower.contains("-wsl")
+}
+
+fn is_wsl() -> bool {
+    let os_release = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    let proc_version = std::fs::read_to_string("/proc/version").ok();
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some()
+        || os_release.as_deref().is_some_and(contains_wsl_marker)
+        || proc_version.as_deref().is_some_and(contains_wsl_marker)
+        || std::path::Path::new("/run/WSL").exists()
+        || std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
 }
 
 fn read_clipboard_image_with_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
@@ -912,6 +1060,12 @@ mod tests {
         );
     }
 
+    fn command_env(command: &Command, key: &str) -> Option<String> {
+        command.get_envs().find_map(|(name, value)| {
+            (name == key).then(|| value.map(|value| value.to_string_lossy().into_owned()))?
+        })
+    }
+
     #[test]
     fn parse_agent_env_hint_accepts_known_agents() {
         assert_eq!(
@@ -1182,7 +1336,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("herdr-notify-send-args-{}", std::process::id()));
         let script = "printf '%s\\n' \"$@\" > \"$HERDR_NOTIFY_ARGS\"";
-        let shown = show_desktop_notification_with_command("-danger", Some("body"), |_| {
+        let shown = show_desktop_notification_for_env("-danger", Some("body"), false, |_| {
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
                 .arg(script)
@@ -1207,5 +1361,68 @@ mod tests {
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    #[test]
+    fn wsl_powershell_notification_command_passes_text_as_environment() {
+        let mut cmd = Command::new("powershell.exe");
+        build_wsl_powershell_notification_command(&mut cmd, r#"build "failed""#, Some("$body"));
+
+        assert_eq!(
+            command_env(&cmd, "HERDR_NOTIFY_TITLE").as_deref(),
+            Some(r#"build "failed""#)
+        );
+        assert_eq!(
+            command_env(&cmd, "HERDR_NOTIFY_BODY").as_deref(),
+            Some("$body")
+        );
+        let wslenv = command_env(&cmd, "WSLENV").expect("WSLENV should be set");
+        assert!(wslenv_contains_var(&wslenv, "HERDR_NOTIFY_TITLE"));
+        assert!(wslenv_contains_var(&wslenv, "HERDR_NOTIFY_BODY"));
+    }
+
+    #[test]
+    fn wsl_notification_wslenv_preserves_existing_entries() {
+        assert_eq!(
+            wsl_notification_wslenv(None),
+            "HERDR_NOTIFY_TITLE:HERDR_NOTIFY_BODY"
+        );
+        assert_eq!(
+            wsl_notification_wslenv(Some("PATH/l:HERDR_NOTIFY_TITLE")),
+            "PATH/l:HERDR_NOTIFY_TITLE:HERDR_NOTIFY_BODY"
+        );
+    }
+
+    #[test]
+    fn wsl_system_notification_prefers_powershell_then_falls_back() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var("WAYLAND_DISPLAY");
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        let mut programs = Vec::new();
+        let shown = show_desktop_notification_for_env("title", Some("body"), true, |program| {
+            programs.push(program.to_string());
+            Command::new("true")
+        })
+        .expect("notification command should spawn");
+
+        assert!(shown);
+        assert_eq!(programs, ["powershell.exe"]);
+
+        programs.clear();
+        let shown = show_desktop_notification_for_env("title", Some("body"), true, |program| {
+            programs.push(program.to_string());
+            if program == "powershell.exe" {
+                Command::new("__herdr_missing_powershell__")
+            } else {
+                Command::new("true")
+            }
+        })
+        .expect("notification command should run");
+
+        assert!(shown);
+        assert_eq!(programs, ["powershell.exe", "notify-send"]);
     }
 }
